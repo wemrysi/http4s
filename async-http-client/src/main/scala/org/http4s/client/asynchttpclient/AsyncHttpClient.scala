@@ -82,7 +82,11 @@ object AsyncHttpClient {
       val onStreamCalled = Ref.unsafe[F, Boolean](false)
 
       override def onStream(publisher: Publisher[HttpResponseBodyPart]): State = {
-        val eff = for {
+        // use fibers to access the ContextShift and ensure that we get off of the AHC thread pool
+        def safeCallback(f: => Unit): F[Unit] =
+          F.start(F.delay(f)).flatMap(_.join)
+
+        val acquire = for {
           _ <- onStreamCalled.set(true)
 
           subscriber <- StreamSubscriber[F, HttpResponseBodyPart]
@@ -92,18 +96,28 @@ object AsyncHttpClient {
           bodyDisposal <- Ref.of[F, F[Unit]] {
             subscriber.stream(subscribeF).pull.uncons.void.stream.compile.drain
           }
+        } yield (subscriber, subscribeF, bodyDisposal)
 
-          body = subscriber
-            .stream(bodyDisposal.set(F.unit) >> subscribeF)
-            .flatMap(part => chunk(Chunk.bytes(part.getBodyPartBytes)))
+        val eff =
+          F.bracketCase(acquire) {
+            case (subscriber, subscribeF, bodyDisposal) =>
+              val body = subscriber
+                .stream(bodyDisposal.set(F.unit) >> subscribeF)
+                .flatMap(part => chunk(Chunk.bytes(part.getBodyPartBytes)))
 
-          responseWithBody = response.copy(body = body)
+              val responseWithBody =
+                response.copy(body = body)
 
-          // use fibers to access the ContextShift and ensure that we get off of the AHC thread pool
-          fiber <- F.start(
-            F.delay(cb(Right(responseWithBody -> (dispose >> bodyDisposal.get.flatten)))))
-          _ <- fiber.join
-        } yield ()
+              safeCallback(cb(Right(responseWithBody -> (dispose >> bodyDisposal.get.flatten))))
+          } {
+            case ((_, _, bodyDisposal), ExitCase.Canceled) =>
+              safeCallback(cb(Right(response -> (dispose >> bodyDisposal.get.flatten))))
+
+            case ((_, _, bodyDisposal), ExitCase.Error(t)) =>
+              bodyDisposal.get.flatten >> safeCallback(cb(Left(t)))
+
+            case (_, ExitCase.Completed) => F.unit
+          }
 
         eff.runAsync(_ => IO.unit).unsafeRunSync()
 
